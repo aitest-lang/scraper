@@ -1,0 +1,43 @@
+<!-- templates/index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Startup Scraper</title>
+</head>
+<body>
+    <h1>Startup Scraper 🚀</h1>
+
+    <form action="/start_scrape" method="POST">
+        <label for="location">Enter Location (e.g., Berlin):</label><br>
+        <input type="text" id="location" name="location" required><br><br>
+        <button type="submit">Start Scraping</button>
+    </form>
+
+    <hr>
+
+    <h2>Status:</h2>
+    <div id="status">
+        Waiting for input...
+    </div>
+
+    <script>
+        function pollStatus() {
+            fetch('/status')
+                .then(res => res.json())
+                .then(data => {
+                    document.getElementById('status').innerText =
+                        `Status: ${data.active ? 'Running' : 'Finished'}, Progress: ${data.progress}/${data.total}`;
+                });
+        }
+
+        setInterval(pollStatus, 5000);
+    </script>
+
+    <hr>
+
+    <a href="/export" download="startup_data.csv">
+        <button>Download CSV</button>
+    </a>
+</body>
+</html>

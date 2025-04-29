@@ -1,4 +1,3 @@
-# File: app.py
 import os
 import re
 import time
@@ -13,13 +12,12 @@ from stem.control import Controller
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from bs4 import BeautifulSoup
-import praw
 import csv
 import threading
 
 # Initialize Flask App
 app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///startups.db')
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///startups.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
@@ -141,26 +139,48 @@ def scrape_github(location):
     except Exception as e:
         logger.error(f"GitHub scrape error: {str(e)}")
 
-# Reddit Scraper
+# Reddit Scraper (HTML-based, no API key)
 def scrape_reddit(location):
+    headers = {
+        'User-Agent': 'Mozilla/5.0',
+        'Accept-Language': 'en-US,en;q=0.9'
+    }
     try:
-        reddit = praw.Reddit(
-            user_agent='StartupScraper/1.0',
-            timeout=10
-        )
-        subreddit = reddit.subreddit(f'{location}startups')
+        url = f'https://www.reddit.com/r/{location.lower()}startups/new/'
+        response = requests.get(url, headers=headers)
         
-        for submission in subreddit.new(limit=100):
-            domain = submission.url.split('/')[2]
-            startup = Startup(
-                name=submission.title[:255],
-                domain=domain,
-                linkedin=None
-            )
-            db.session.add(startup)
-            db.session.commit()
-            logger.info(f"Added Reddit startup: {domain}")
-            
+        if response.status_code != 200:
+            logger.warning(f"Reddit returned status code {response.status_code}")
+            return
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        post_links = soup.select('a[data-click-id="body"]')
+
+        seen_domains = set()
+
+        for link in post_links:
+            full_url = f"https://reddit.com{link['href']}"
+            title = link.find_previous('h3')  # Find associated title
+            name = title.text.strip() if title else "Unknown"
+
+            # Try to extract domain from post URL
+            try:
+                domain = full_url.split("/")[2]  # Safe extraction
+                if domain.endswith(".reddit.com") or domain in seen_domains:
+                    continue
+                seen_domains.add(domain)
+                
+                startup = Startup(
+                    name=name[:255],
+                    domain=domain,
+                    linkedin=None
+                )
+                db.session.add(startup)
+                db.session.commit()
+                logger.info(f"Added Reddit startup: {domain}")
+            except IndexError:
+                continue
+
     except Exception as e:
         logger.error(f"Reddit scrape error: {str(e)}")
 

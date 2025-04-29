@@ -1,17 +1,14 @@
 import os
-import re
 import time
 import random
 import logging
-import requests
+import re
 from datetime import datetime
 from flask import Flask, render_template, request, send_file, jsonify
 from flask_sqlalchemy import SQLAlchemy
-from stem import Signal
-from stem.control import Controller
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
 from bs4 import BeautifulSoup
+import requests
+from fake_useragent import UserAgent
 import csv
 import threading
 
@@ -21,9 +18,10 @@ app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///sta
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
-# Configure Logging
+# Logging Setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+ua = UserAgent()
 
 # Models
 class Startup(db.Model):
@@ -32,7 +30,7 @@ class Startup(db.Model):
     domain = db.Column(db.String(255), unique=True)
     linkedin = db.Column(db.String(255))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    
+
 class Contact(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     startup_id = db.Column(db.Integer, db.ForeignKey('startup.id'))
@@ -44,219 +42,132 @@ class Technology(db.Model):
     startup_id = db.Column(db.Integer, db.ForeignKey('startup.id'))
     tech_name = db.Column(db.String(255))
 
-# Tor IP Rotation
-def renew_tor_ip():
-    try:
-        with Controller.from_port(port=9051) as controller:
-            controller.authenticate()
-            controller.signal(Signal.NEWNYM)
-        logger.info("Changed Tor IP")
-    except Exception as e:
-        logger.error(f"IP rotation failed: {str(e)}")
+# Scraping Functions
+def get_headers():
+    return {'User-Agent': ua.random}
 
-# Configure Selenium with Tor
-def create_browser():
-    chrome_options = Options()
-    chrome_options.add_argument('--proxy-server=socks5://127.0.0.1:9050')
-    chrome_options.add_argument('--headless')
-    chrome_options.add_argument('--disable-gpu')
-    chrome_options.add_argument('--no-sandbox')
-    chrome_options.add_argument('--disable-dev-shm-usage')
-    chrome_options.add_argument('blink-settings=imagesEnabled=false')
-    
-    return webdriver.Chrome(options=chrome_options)
-
-# Email Pattern Generator
-def generate_email_patterns(name, domain):
-    username_patterns = [
-        name.split()[0].lower(),  # first name
-        name.split()[-1].lower(),  # last name
-        name[0].lower() + name.split()[-1].lower(),  # fname initial + lname
-        ''.join(name.split()).lower(),  # full name
-    ]
-    
-    for username in username_patterns:
-        yield f"{username}@{domain}"
-        yield f"{username}_info@{domain}"
-        yield f"{username}.info@{domain}"
-
-# Google Maps Scraper
+# Google Maps Scraper (via Requests + Parsing)
 def scrape_google_maps(location):
-    browser = create_browser()
+    url = f'https://www.google.com/search?q=startups+in+{location}&tbm=lcl'
     try:
-        browser.get(f"https://www.google.com/maps/search/startups+in+{location}")
-        scroll_pause = 5
-        last_height = browser.execute_script("return document.body.scrollHeight")
-        
-        while True:
-            browser.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(scroll_pause)
-            new_height = browser.execute_script("return document.body.scrollHeight")
-            
-            if new_height == last_height:
-                break
-            last_height = new_height
-            
-        soup = BeautifulSoup(browser.page_source, 'html.parser')
-        companies = soup.find_all('div', class_='section-result-text-content')
-        
-        for company in companies:
-            name = company.find('h3').text.strip()
-            domain = None  # Extract domain from details if available
-            if name and domain:
-                startup = Startup(name=name, domain=domain)
+        res = requests.get(url, headers=get_headers())
+        soup = BeautifulSoup(res.text, 'html.parser')
+
+        for item in soup.select('.tF2Cxc'):
+            title = item.select_one('h3').text.strip()
+            # Try to extract website link
+            try:
+                link = item.select_one('a')['href']
+                domain = link.split('/')[2]
+                logger.info(f"Found: {title} - {domain}")
+                startup = Startup(name=title[:255], domain=domain, linkedin=None)
                 db.session.add(startup)
                 db.session.commit()
-                logger.info(f"Added {name}")
-                
+            except Exception as e:
+                logger.warning(f"Parsing failed: {str(e)}")
     except Exception as e:
-        logger.error(f"Google Maps scrape error: {str(e)}")
-    finally:
-        browser.quit()
+        logger.error(f"Google Maps scrape failed: {str(e)}")
 
 # GitHub Scraper
 def scrape_github(location):
-    headers = {'User-Agent': 'StartupScraper/1.0'}
+    url = f"https://api.github.com/search/users?q=location:{location}+job:founder"
     try:
-        url = f"https://api.github.com/search/users?q=location:{location}+job:founder"
-        response = requests.get(url, headers=headers)
-        data = response.json()
-        
-        for item in data.get('items', []):
-            github_profile = requests.get(item['url']).json()
-            blog_url = github_profile.get('blog', '')
-            if blog_url.startswith(('http://', 'https://')):
-                domain = blog_url.split('/')[2]
+        res = requests.get(url, headers=get_headers())
+        users = res.json().get('items', [])
+        for user in users:
+            profile = requests.get(user['url'], headers=get_headers()).json()
+            blog = profile.get('blog', '')
+            if blog.startswith(('http://', 'https://')):
+                domain = blog.split('/')[2]
                 startup = Startup(
-                    name=item['login'],
+                    name=user['login'],
                     domain=domain,
-                    linkedin=github_profile.get('linkedin_username')
+                    linkedin=profile.get('linkedin_username')
                 )
                 db.session.add(startup)
                 db.session.commit()
                 logger.info(f"Added GitHub startup: {domain}")
-                
     except Exception as e:
         logger.error(f"GitHub scrape error: {str(e)}")
 
-# Reddit Scraper (HTML-based, no API key)
+# Reddit HTML-Based Scraper
 def scrape_reddit(location):
-    headers = {
-        'User-Agent': 'Mozilla/5.0',
-        'Accept-Language': 'en-US,en;q=0.9'
-    }
+    headers = {'User-Agent': ua.random}
+    url = f'https://www.reddit.com/r/{location.lower()}startups/new/'
     try:
-        url = f'https://www.reddit.com/r/{location.lower()}startups/new/'
-        response = requests.get(url, headers=headers)
-        
-        if response.status_code != 200:
-            logger.warning(f"Reddit returned status code {response.status_code}")
+        res = requests.get(url, headers=headers)
+        if res.status_code != 200:
+            logger.warning("Reddit rate limit or error")
             return
-
-        soup = BeautifulSoup(response.text, 'html.parser')
-        post_links = soup.select('a[data-click-id="body"]')
-
+        soup = BeautifulSoup(res.text, 'html.parser')
+        posts = soup.select('a[data-click-id="body"]')
         seen_domains = set()
-
-        for link in post_links:
-            full_url = f"https://reddit.com{link['href']}"
-            title = link.find_previous('h3')  # Find associated title
-            name = title.text.strip() if title else "Unknown"
-
-            # Try to extract domain from post URL
+        
+        for post in posts:
+            full_url = f"https://reddit.com{post['href']}"
             try:
-                domain = full_url.split("/")[2]  # Safe extraction
+                domain = full_url.split("/")[2]
                 if domain.endswith(".reddit.com") or domain in seen_domains:
                     continue
                 seen_domains.add(domain)
-                
-                startup = Startup(
-                    name=name[:255],
-                    domain=domain,
-                    linkedin=None
-                )
+                startup = Startup(name="Unknown", domain=domain, linkedin=None)
                 db.session.add(startup)
                 db.session.commit()
-                logger.info(f"Added Reddit startup: {domain}")
+                logger.info(f"Reddit: Added {domain}")
             except IndexError:
                 continue
-
     except Exception as e:
         logger.error(f"Reddit scrape error: {str(e)}")
 
 # Email Discovery
 def discover_emails(domain):
-    common_paths = ['/contact', '/about', '/careers', '/contact-us']
-    visited = set()
-    
-    try:
-        # Check root page
-        response = requests.get(f"https://{domain}", timeout=10)
-        emails = re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", response.text)
-        
-        for email in emails:
-            contact = Contact(email=email, startup_id=1, source="root")
-            db.session.add(contact)
-            
-        # Check common contact pages
-        for path in common_paths:
-            if f"https://{domain}{path}" not in visited:
-                res = requests.get(f"https://{domain}{path}", timeout=10)
-                visited.add(res.url)
-                emails += re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", res.text)
-                
-        # Save discovered emails
-        for email in set(emails):
-            contact = Contact(email=email, startup_id=1, source=path)
-            db.session.add(contact)
-            
-        db.session.commit()
-        
-    except Exception as e:
-        logger.error(f"Email discovery failed for {domain}: {str(e)}")
+    paths = ['', '/about', '/contact', '/careers']
+    emails = set()
+    for path in paths:
+        try:
+            res = requests.get(f'https://{domain}{path}', timeout=10, headers=get_headers())
+            found = re.findall(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', res.text)
+            emails.update(found)
+        except Exception as e:
+            logger.debug(f"Email search failed for {path}: {e}")
+    for email in emails:
+        contact = Contact(email=email, startup_id=1, source='email_discovery')
+        db.session.add(contact)
+    db.session.commit()
 
-# Technology Detection
-def detect_technology(domain):
+# Tech Detection from Job Page
+def detect_tech_stack(domain):
     tech_patterns = {
         'frameworks': ['react', 'vue', 'angular', 'django', 'flask', 'rails'],
-        'hosting': ['heroku', 'aws', 'azure', 'firebase', 'netlify'],
-        'ecommerce': ['shopify', 'woocommerce', 'bigcommerce']
+        'hosting': ['heroku', 'aws', 'azure', 'firebase', 'netlify']
     }
-    
     try:
-        response = requests.get(f"https://{domain}/jobs", timeout=10)
-        text = response.text.lower()
-        
-        detected = []
+        res = requests.get(f'https://{domain}/jobs', timeout=10, headers=get_headers())
+        text = res.text.lower()
         for category, patterns in tech_patterns.items():
             for pattern in patterns:
                 if pattern in text:
-                    detected.append((category, pattern))
-                    
-        for category, tech in detected:
-            tech_record = Technology(tech_name=tech, startup_id=1)
-            db.session.add(tech_record)
-            
+                    tech = Technology(tech_name=pattern, startup_id=1)
+                    db.session.add(tech)
         db.session.commit()
-        
     except Exception as e:
-        logger.error(f"Tech detection failed: {str(e)}")
+        logger.debug(f"Tech detection failed for {domain}: {e}")
 
-# Background Scraper Thread
+# Background Scrape Worker
 def run_scraper(location):
     global scraping_status
     scraping_status = {"active": True, "progress": 0, "total": 30}
     
     try:
-        thread1 = threading.Thread(target=scrape_google_maps, args=(location,))
-        thread2 = threading.Thread(target=scrape_github, args=(location,))
-        thread3 = threading.Thread(target=scrape_reddit, args=(location,))
+        t1 = threading.Thread(target=scrape_google_maps, args=(location,))
+        t2 = threading.Thread(target=scrape_github, args=(location,))
+        t3 = threading.Thread(target=scrape_reddit, args=(location,))
         
-        thread1.start()
-        thread2.start()
-        thread3.start()
+        t1.start()
+        t2.start()
+        t3.start()
         
-        while any(t.is_alive() for t in [thread1, thread2, thread3]):
+        while any(t.is_alive() for t in [t1, t2, t3]):
             time.sleep(5)
             scraping_status["progress"] += 1
             
@@ -272,13 +183,11 @@ def index():
 
 @app.route('/start_scrape', methods=['POST'])
 def start_scrape():
-    location = request.form['location']
+    location = request.form.get('location')
     if not location:
-        return jsonify({"error": "Location is required"}), 400
-        
+        return jsonify({"error": "Location required"}), 400
     thread = threading.Thread(target=run_scraper, args=(location,))
     thread.start()
-    
     return jsonify({"status": "started", "location": location})
 
 @app.route('/status')
@@ -290,19 +199,10 @@ def export_data():
     si = StringIO()
     cw = csv.writer(si)
     cw.writerow(['Company Name', 'Domain', 'Emails', 'Technologies', 'LinkedIn'])
-    
-    startups = Startup.query.all()
-    for startup in startups:
-        emails = ';'.join([c.email for c in startup.contacts])
-        techs = ';'.join([t.tech_name for t in startup.technologies])
-        cw.writerow([
-            startup.name,
-            startup.domain,
-            emails,
-            techs,
-            startup.linkedin
-        ])
-        
+    for s in Startup.query.all():
+        emails = ';'.join([c.email for c in s.contacts])
+        techs = ';'.join([t.tech_name for t in s.technologies])
+        cw.writerow([s.name, s.domain, emails, techs, s.linkedin])
     output = make_response(si.getvalue())
     output.headers["Content-Disposition"] = "attachment; filename=startup_data.csv"
     output.headers["Content-type"] = "text/csv"
@@ -311,9 +211,7 @@ def export_data():
 # Main
 if __name__ == '__main__':
     scraping_status = {"active": False, "progress": 0, "total": 100}
-    
     with app.app_context():
         db.create_all()
-        
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
